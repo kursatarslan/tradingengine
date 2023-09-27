@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Text;
 using Newtonsoft.Json;
 using Npgsql;
@@ -49,10 +50,12 @@ namespace TradingEngine
             var factory = new ConnectionFactory() { HostName = "localhost" };
             using var connection = factory.CreateConnection();
             NpgsqlConnection.GlobalTypeMapper.MapEnum<OrderType>("ordertype");
+            var redLockFactory = RedLockFactory.Create(new List<RedLockMultiplexer> { redis });
 
             using var channel = connection.CreateModel();
             channel.QueueDeclare(queue: "engine1", durable: false, exclusive: false, autoDelete: false,
                 arguments: null);
+                
 
             var consumer = new EventingBasicConsumer(channel);
             consumer.Received += (model, ea) =>
@@ -76,6 +79,7 @@ namespace TradingEngine
                     }
 
                     ProcessOrder(order);
+                    channel.BasicAck(ea.DeliveryTag, false);
                 }
                 catch (Exception e)
                 {
@@ -83,7 +87,8 @@ namespace TradingEngine
                 }
             };
 
-            channel.BasicConsume(queue: "engine1", autoAck: true, consumer: consumer);
+            channel.BasicConsume(queue: "engine1", autoAck: false, consumer: consumer);
+
             Console.WriteLine("Listening to engine1 queue...");
 
             Console.WriteLine("Press any key to exit...");
@@ -92,61 +97,96 @@ namespace TradingEngine
 
         static void ProcessOrder(Order order)
         {
-            if (order.Type == OrderType.Buy)
+            var redisTransaction = db.CreateTransaction();
+            using (var redLock = redLockFactory.CreateLock("OrderMatchingLock", TimeSpan.FromSeconds(30)))
             {
-                PrintSortedSet("SELL");
-                Console.WriteLine("ProcessOrder buying.....");
-                var bestSellOrders = db.SortedSetRangeByScoreWithScores("SELL", start: double.NegativeInfinity,
-                    stop: (double)order.Price, order: StackExchange.Redis.Order.Ascending).FirstOrDefault();
-
-                RedisValue bestOrderJson = bestSellOrders.Element;
-
-                Console.WriteLine(
-                    $"ProcessOrder bestSellOrders.Element.IsNullOrEmpty {bestSellOrders.Element.IsNullOrEmpty} ");
-
-                if (!bestSellOrders.Element.IsNullOrEmpty /*&& Convert.ToDecimal(bestSellOrder.Score) <= order.Price*/)
+                if (!redLock.IsAcquired) 
                 {
-                    Console.WriteLine(
-                        $"Found Matching Sell Order: {bestSellOrders.Element}, Score: {bestSellOrders.Score}");
-
-
-                    // You might want to ExecuteOrder here if a matching sell order is found.
-                    ExecuteOrder(order, bestOrderJson.ToString());
+                    Console.WriteLine("Failed to acquire RedLock. Skipping order processing.");
+                    return;
                 }
-                else
+                
+                if (order.Type == OrderType.Buy)
                 {
-                    // Otherwise, add the buy order to the SortedSet with a negative score
-                    db.SortedSetAdd("BUY", JsonConvert.SerializeObject(order), Convert.ToDouble(-order.Price));
+                    PrintSortedSet("SELL");
+                    Console.WriteLine("ProcessOrder buying.....");
+                    var bestSellOrders = db.SortedSetRangeByScoreWithScores("SELL", start: double.NegativeInfinity,
+                        stop: (double)order.Price, order: StackExchange.Redis.Order.Ascending).FirstOrDefault();
+
+                    RedisValue bestOrderJson = bestSellOrders.Element;
+
                     Console.WriteLine(
-                        $"No matching Sell order found, Order added to BUY set: {JsonConvert.SerializeObject(order)}");
+                        $"ProcessOrder bestSellOrders.Element.IsNullOrEmpty {bestSellOrders.Element.IsNullOrEmpty} ");
+
+                    if (!bestSellOrders.Element.IsNullOrEmpty /*&& Convert.ToDecimal(bestSellOrder.Score) <= order.Price*/)
+                    {
+                        Console.WriteLine(
+                            $"Found Matching Sell Order: {bestSellOrders.Element}, Score: {bestSellOrders.Score}");
+
+
+                        // You might want to ExecuteOrder here if a matching sell order is found.
+                        ExecuteOrder(order, bestOrderJson.ToString());
+                    }
+                    else
+                    {
+                        // Otherwise, add the buy order to the SortedSet with a negative score
+                        var transactionAdded = redisTransaction.SortedSetAddAsync("BUY", JsonConvert.SerializeObject(order), Convert.ToDouble(-order.Price));
+
+                        if (redisTransaction.Execute())
+                        {
+                            Console.WriteLine($"No matching Sell order found, Order added to BUY set: {JsonConvert.SerializeObject(order)}");
+                        }
+                        else
+                        {
+                            Console.WriteLine("Failed to execute Redis transaction.");
+                        }
+                    }
                 }
-            }
-            else if (order.Type == OrderType.Sell)
-            {
-                PrintSortedSet("BUY");
-
-                Console.WriteLine("ProcessOrder selling.....");
-                var bestBuyOrders = db.SortedSetRangeByScoreWithScores("BUY", start: (double)order.Price,
-                    stop: double.PositiveInfinity, order: StackExchange.Redis.Order.Descending).FirstOrDefault();
-                RedisValue bestOrderJson = bestBuyOrders.Element;
-
-                // Check if a matching buy order exists, and process it if it does.
-                Console.WriteLine(
-                    $"ProcessOrder bestBuyOrders.Element.IsNullOrEmpty{bestBuyOrders.Element.IsNullOrEmpty} ");
-                if (!bestBuyOrders.Element.IsNullOrEmpty /*&& Convert.ToDecimal(-bestBuyOrder.Score) >= order.Price*/)
+                else if (order.Type == OrderType.Sell)
                 {
-                    Console.WriteLine(
-                        $"Found Matching Buy Order: {bestBuyOrders.Element}, Score: {bestBuyOrders.Score}");
+                    PrintSortedSet("BUY");
 
-                    ExecuteOrder(order, bestOrderJson.ToString());
-                }
-                else
-                {
-                    // Otherwise, add the sell order to the SortedSet with the positive score
-                    db.SortedSetAdd("SELL", JsonConvert.SerializeObject(order), Convert.ToDouble(order.Price));
+                    Console.WriteLine("ProcessOrder selling.....");
+                    var bestBuyOrders = db.SortedSetRangeByScoreWithScores("BUY", start: (double)order.Price,
+                            stop: double.PositiveInfinity, order: StackExchange.Redis.Order.Descending)
+                        .FirstOrDefault();
+                    RedisValue bestOrderJson = bestBuyOrders.Element;
+
+                    // Check if a matching buy order exists, and process it if it does.
                     Console.WriteLine(
-                        $"No matching Buy order found, Order added to SELL set: {JsonConvert.SerializeObject(order)}");
+                        $"ProcessOrder bestBuyOrders.Element.IsNullOrEmpty{bestBuyOrders.Element.IsNullOrEmpty} ");
+                    if (!bestBuyOrders.Element
+                            .IsNullOrEmpty /*&& Convert.ToDecimal(-bestBuyOrder.Score) >= order.Price*/)
+                    {
+                        Console.WriteLine(
+                            $"Found Matching Buy Order: {bestBuyOrders.Element}, Score: {bestBuyOrders.Score}");
+
+                        ExecuteOrder(order, bestOrderJson.ToString());
+                    }
+                    else
+                    {
+                        // Otherwise, add the sell order to the SortedSet with the positive score
+                        var transactionAdded = redisTransaction.SortedSetAddAsync("SELL", JsonConvert.SerializeObject(order), Convert.ToDouble(order.Price));
+                        
+                        if (redisTransaction.Execute())
+                        {
+                            Console.WriteLine($"No matching Buy order found, Order added to SELL set: {JsonConvert.SerializeObject(order)}");
+                        }
+                        else
+                        {
+                            Console.WriteLine("Failed to execute Redis transaction.");
+                        }
+                            
+                    }
+                    if (!redisTransaction.Execute()) 
+                    {
+                        Console.WriteLine("Failed to execute Redis transaction. Rolling back.");
+                        redisTransaction.Rollback(); // Rollback or equivalent in case of failure.
+                        return;
+                    }
+
                 }
+                
             }
 
             static void ExecuteOrder(Order newOrder, string matchedOrderJson)
@@ -195,17 +235,18 @@ namespace TradingEngine
                     }
 
                     // Insert the orders
-                     using var cmdInsertOrder = new NpgsqlCommand(
-                    "INSERT INTO orders(OrderId, UserId, Symbol, Type, Quantity, Price) VALUES (@OrderId, @UserId, @Symbol, @Type, @Quantity, @Price);",
-                    connection);
+                    using var cmdInsertOrder = new NpgsqlCommand(
+                        "INSERT INTO orders(OrderId, UserId, Symbol, Type, Quantity, Price) VALUES (@OrderId, @UserId, @Symbol, @Type, @Quantity, @Price);",
+                        connection);
                     cmdInsertOrder.Parameters.AddWithValue("OrderId", newOrder.OrderId);
                     cmdInsertOrder.Parameters.AddWithValue("UserId", newOrder.UserId);
                     cmdInsertOrder.Parameters.AddWithValue("Symbol", newOrder.Symbol);
                     cmdInsertOrder.Parameters.AddWithValue("Type", (int)newOrder.Type); // Cast to int
                     cmdInsertOrder.Parameters.AddWithValue("Quantity", newOrder.Quantity);
                     cmdInsertOrder.Parameters.AddWithValue("Price", newOrder.Price);
-                    Console.WriteLine($"Insertion new order OrderId {newOrder.OrderId} id {newOrder.UserId} Symbol {newOrder.Symbol} Price {newOrder.Price}.");
-     
+                    Console.WriteLine(
+                        $"Insertion new order OrderId {newOrder.OrderId} id {newOrder.UserId} Symbol {newOrder.Symbol} Price {newOrder.Price}.");
+
                     var newOrderId = cmdInsertOrder.ExecuteNonQuery();
                     Console.WriteLine($" Done");
 
@@ -283,6 +324,7 @@ namespace TradingEngine
                     transaction.Rollback();
                 }
             }
+
             static void AdjustUserBalance(NpgsqlConnection connection, string userId, string column, decimal amount)
             {
                 var cmdText = column switch
