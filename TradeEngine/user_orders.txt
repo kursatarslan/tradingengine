@@ -1,0 +1,19 @@
+CREATE TABLE IF NOT EXISTS public.orders
+(
+    orderid    UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    userid     VARCHAR(50) NOT NULL
+        REFERENCES public.users
+            ON DELETE CASCADE,
+    symbol     VARCHAR(5) NOT NULL,
+    quantity   NUMERIC(18, 2) NOT NULL,
+    price      NUMERIC(18, 2) NOT NULL,
+    type       INTEGER NOT NULL,
+    is_deleted BOOLEAN DEFAULT false
+);
+
+ALTER TABLE public.orders
+    OWNER TO postgres;
+
+CREATE INDEX IF NOT EXISTS idx_orders_symbol_type_price
+    ON public.orders (symbol, type, price)
+    WHERE (is_deleted = false);
