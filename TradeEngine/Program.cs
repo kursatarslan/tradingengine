@@ -7,7 +7,11 @@ using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using StackExchange.Redis;
 using System.Linq;
+using System.Net;
 using Newtonsoft.Json.Converters;
+using RedLockNet;
+using RedLockNet.SERedis;
+using RedLockNet.SERedis.Configuration;
 
 namespace TradingEngine
 {
@@ -42,7 +46,16 @@ namespace TradingEngine
 
         static readonly ConnectionMultiplexer redis = ConnectionMultiplexer.Connect("localhost");
         static readonly IDatabase db = redis.GetDatabase();
+        static readonly RedLockFactory redLockFactory = CreateRedLockFactory();
 
+        static RedLockFactory CreateRedLockFactory()
+        {
+            var endPoints = new List<RedLockEndPoint>
+            {
+                new DnsEndPoint("localhost", 6379)
+            };
+            return RedLockFactory.Create(endPoints);
+        }
         static void Main()
         {
             Console.WriteLine("Trading Engine started. Waiting for orders...");
@@ -50,7 +63,7 @@ namespace TradingEngine
             var factory = new ConnectionFactory() { HostName = "localhost" };
             using var connection = factory.CreateConnection();
             NpgsqlConnection.GlobalTypeMapper.MapEnum<OrderType>("ordertype");
-            var redLockFactory = RedLockFactory.Create(new List<RedLockMultiplexer> { redis });
+
 
             using var channel = connection.CreateModel();
             channel.QueueDeclare(queue: "engine1", durable: false, exclusive: false, autoDelete: false,
@@ -181,7 +194,6 @@ namespace TradingEngine
                     if (!redisTransaction.Execute()) 
                     {
                         Console.WriteLine("Failed to execute Redis transaction. Rolling back.");
-                        redisTransaction.Rollback(); // Rollback or equivalent in case of failure.
                         return;
                     }
 
