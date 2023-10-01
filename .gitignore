@@ -1,0 +1,25 @@
+﻿/.vs/
+/.vs/*
+bin
+obj
+packages
+  
+  # Ignore any files in /bin and /obj Folders
+**/bin/*
+**/obj/*
+
+/OBJ
+/obj
+/OBJ/*
+/obj/*
+OBJ/**
+obj/**
+**/OBJ
+**/obj
+**/*/OBJ
+**/*/obj
+**/*/OBJ/
+**/*/obj/
+**/*/OBJ/*
+**/*/obj/*
+
